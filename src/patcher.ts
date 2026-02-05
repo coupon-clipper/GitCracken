@@ -10,6 +10,169 @@ import {baseDir} from "../global";
 import {CURRENT_PLATFORM, Platforms} from "./platform";
 
 /**
+ * Custom asar extraction that handles missing unpacked files gracefully
+ */
+function extractAsarWithUnpacked(asarFile: string, destDir: string): void {
+  const unpackedDir = asarFile + ".unpacked";
+
+  // Pre-copy the unpacked directory if it exists (before extraction)
+  if (fs.existsSync(unpackedDir)) {
+    copyUnpackedFiles(unpackedDir, destDir);
+  }
+
+  // Try extractAll, if it fails due to missing unpacked files, fall back to manual extraction
+  try {
+    asar.extractAll(asarFile, destDir);
+  } catch (e) {
+    const err = e as any;
+    // If error is about missing unpacked file, use manual extraction
+    if (err.code === "ENOENT" && err.path && err.path.includes(".unpacked")) {
+      console.warn(
+        "Warning: Some unpacked files are missing, using fallback extraction...",
+      );
+      extractAsarManually(asarFile, destDir, unpackedDir);
+    } else {
+      throw e;
+    }
+  }
+}
+
+/**
+ * Get the asar header to check file metadata
+ */
+function getAsarHeader(asarFile: string): any {
+  const disk = require("asar/lib/disk");
+  return disk.readArchiveHeaderSync(asarFile).header;
+}
+
+/**
+ * Check if a path in the asar is a directory or file
+ * Returns: { isDir: boolean, isUnpacked: boolean, exists: boolean }
+ */
+function getAsarEntryInfo(
+  header: any,
+  filePath: string,
+): {isDir: boolean; isUnpacked: boolean; exists: boolean} {
+  const parts = filePath.split(/[\\\/]/).filter((p) => p);
+  let node = header;
+
+  for (const part of parts) {
+    if (!node.files || !node.files[part]) {
+      return {isDir: false, isUnpacked: false, exists: false};
+    }
+    node = node.files[part];
+  }
+
+  const isDir = "files" in node;
+  const isUnpacked = node.unpacked === true;
+  return {isDir, isUnpacked, exists: true};
+}
+
+/**
+ * Manual asar extraction that skips missing unpacked files
+ */
+function extractAsarManually(
+  asarFile: string,
+  destDir: string,
+  unpackedDir: string,
+): void {
+  const filenames: string[] = (asar as any).listPackage(asarFile);
+  const header = getAsarHeader(asarFile);
+
+  for (const filename of filenames) {
+    // Normalize path - remove leading slashes
+    const normalizedFilename = filename.replace(/^[\\\/]+/, "");
+    const destFilename = path.join(destDir, normalizedFilename);
+
+    // Get entry info from header
+    const entryInfo = getAsarEntryInfo(header, normalizedFilename);
+
+    // If it's a directory, just ensure it exists and continue
+    if (entryInfo.isDir) {
+      if (!fs.existsSync(destFilename)) {
+        fs.ensureDirSync(destFilename);
+      }
+      continue;
+    }
+
+    // If file already exists as a proper file, skip
+    if (fs.existsSync(destFilename)) {
+      const stat = fs.statSync(destFilename);
+      if (stat.isFile()) {
+        continue;
+      }
+      // If it's a directory but should be a file, remove it
+      if (stat.isDirectory()) {
+        fs.removeSync(destFilename);
+      }
+    }
+
+    // If it's an unpacked file, it should have been copied already
+    // If missing from unpacked dir, skip it
+    if (entryInfo.isUnpacked) {
+      console.warn(
+        `Warning: Skipping missing unpacked file: ${normalizedFilename}`,
+      );
+      continue;
+    }
+
+    try {
+      // Extract regular (non-unpacked) file
+      const file = (asar as any).extractFile(asarFile, normalizedFilename);
+      if (file !== undefined && Buffer.isBuffer(file)) {
+        fs.ensureDirSync(path.dirname(destFilename));
+        fs.writeFileSync(destFilename, file);
+      }
+    } catch (e) {
+      const err = e as any;
+      // Skip any remaining errors gracefully
+      console.warn(
+        `Warning: Failed to extract ${normalizedFilename}: ${err.message}`,
+      );
+      continue;
+    }
+  }
+}
+
+/**
+ * Recursively copy unpacked files to destination
+ */
+function copyUnpackedFiles(srcDir: string, destDir: string): void {
+  if (!fs.existsSync(srcDir)) {
+    return;
+  }
+
+  const items = fs.readdirSync(srcDir);
+  for (const item of items) {
+    const srcPath = path.join(srcDir, item);
+    const destPath = path.join(destDir, item);
+
+    try {
+      const stat = fs.statSync(srcPath);
+      if (stat.isDirectory()) {
+        fs.ensureDirSync(destPath);
+        copyUnpackedFiles(srcPath, destPath);
+      } else {
+        fs.ensureDirSync(path.dirname(destPath));
+        fs.copyFileSync(srcPath, destPath);
+      }
+    } catch (e) {
+      // Skip files that can't be accessed (might be symlinks or permission issues)
+      const err = e as any;
+      if (
+        err.code === "ENOENT" ||
+        err.code === "EPERM" ||
+        err.code === "EACCES"
+      ) {
+        console.warn(`Warning: Skipping inaccessible file: ${srcPath}`);
+        continue;
+      }
+      throw e;
+    }
+  }
+}
+
+/**
  * Patcher options
  */
 export interface IPatcherOptions {
@@ -144,7 +307,7 @@ export class Patcher {
    * @throws Error
    */
   public unpackAsar(): void {
-    asar.extractAll(this.asar, this.dir);
+    extractAsarWithUnpacked(this.asar, this.dir);
   }
 
   /**
@@ -184,11 +347,12 @@ export class Patcher {
   private patchDirWithPro(): void {
     const bundlePath = path.join(this.dir, "src/main/static/main.bundle.js");
 
-    const patchedPattern = '(delete json.proAccessState,delete json.licenseExpiresAt,json={...json,licensedFeatures:["pro"]});';
+    const patchedPattern =
+      '(delete json.proAccessState,delete json.licenseExpiresAt,json={...json,licensedFeatures:["pro"]});';
 
     const pattern1 = /const [^=]*="dev"===[^?]*\?"[\w+/=]+":"[\w+/=]+";/;
     const pattern2 = /return (JSON\.parse\(\([^;]*?\)\(Buffer\.from\([^;]*?,"base64"\)\.toString\("utf8"\),Buffer\.from\([^;]*?\.secure,"base64"\)\)\.toString\("utf8"\)\))\};/;
-    const searchValue = new RegExp(`(?<=${pattern1.source})${pattern2.source}`)
+    const searchValue = new RegExp(`(?<=${pattern1.source})${pattern2.source}`);
     const replaceValue =
       "var json=$1;" +
       '("licenseExpiresAt"in json||"licensedFeatures"in json)&&' +
@@ -198,7 +362,10 @@ export class Patcher {
     const sourceData = fs.readFileSync(bundlePath, "utf-8");
     const sourcePatchedData = sourceData.replace(searchValue, replaceValue);
     if (sourceData === sourcePatchedData) {
-      if (sourceData.indexOf(patchedPattern) < 0) throw new Error("Can't patch pro features, pattern match failed. Get support from https://t.me/gitkrakencrackchat");
+      if (sourceData.indexOf(patchedPattern) < 0)
+        throw new Error(
+          "Can't patch pro features, pattern match failed. Get support from https://t.me/gitkrakencrackchat",
+        );
       throw new Error("It's already patched.");
     }
     fs.writeFileSync(bundlePath, sourcePatchedData, "utf-8");
